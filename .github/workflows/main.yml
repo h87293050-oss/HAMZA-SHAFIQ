@@ -1,4 +1,4 @@
-name: RDP with Public IP Fallback
+name: RDP with Tailscale Fix
 
 on:
   workflow_dispatch:
@@ -9,32 +9,117 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Get Public IP
-        id: ip
+      - name: Configure RDP
         run: |
-          $publicIP = (Invoke-RestMethod -Uri "https://api.ipify.org").Trim()
-          echo "PUBLIC_IP=$publicIP" >> $env:GITHUB_ENV
-          Write-Host "Public IP: $publicIP"
-
-      - name: Configure RDP Settings
-        run: |
-          # Enable RDP
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-          
-          # Open firewall for RDP
-          netsh advfirewall firewall add rule name="Open RDP Port" dir=in action=allow protocol=TCP localport=3389
+          netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
 
-      - name: Create User with Fixed Credentials
+      - name: Create User
         run: |
           $username = "RDPUser"
           $password = "Password123!"
-          
-          # Create user
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
           New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -ErrorAction SilentlyContinue
           Set-LocalUser -Name $username -Password $securePass
+          Add-LocalGroupMember -Group "Administrators" -Member $username
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
           
+          echo "RDP_USERNAME=$username" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+      - name: Install Tailscale (Direct Download)
+        run: |
+          # Direct download without web request
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "C:\tailscale.msi"
+          
+          # Use .NET WebClient for more reliable download
+          $webClient = New-Object System.Net.WebClient
+          $webClient.DownloadFile($tsUrl, $installerPath)
+          
+          Start-Process msiexec.exe -Wait -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart"
+          Remove-Item $installerPath -Force
+          Start-Sleep -Seconds 10
+
+      - name: Start Tailscale
+        run: |
+          # Wait for Tailscale service to start
+          Start-Service -Name Tailscale -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 10
+          
+          # Check if Tailscale is installed properly
+          if (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe") {
+            Write-Host "Tailscale found at: $env:ProgramFiles\Tailscale"
+          } else {
+            Write-Host "Checking alternative locations..."
+            Get-ChildItem "C:\" -Recurse -Filter "tailscale.exe" -ErrorAction SilentlyContinue | ForEach-Object {
+              Write-Host "Found at: $($_.FullName)"
+            }
+          }
+          
+          # Simple connection test
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-rdp
+          Start-Sleep -Seconds 15
+          
+          # Get IP with timeout
+          $tsIP = $null
+          $attempts = 0
+          while (-not $tsIP -and $attempts -lt 10) {
+            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
+            if (-not $tsIP) {
+              $attempts++
+              Start-Sleep -Seconds 5
+              Write-Host "Attempt $attempts/10 - Waiting for Tailscale IP..."
+            }
+          }
+          
+          if ($tsIP) {
+            echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+            Write-Host "Tailscale IP: $tsIP"
+          } else {
+            Write-Host "Could not get Tailscale IP, using public IP as fallback..."
+            $publicIP = (Invoke-RestMethod -Uri "https://api.ipify.org").Trim()
+            echo "PUBLIC_IP=$publicIP" >> $env:GITHUB_ENV
+          }
+
+      - name: Display Connection Info
+        run: |
+          Write-Host "=============================================="
+          Write-Host "RDP CONNECTION INFORMATION"
+          Write-Host "=============================================="
+          Write-Host "Username: $env:RDP_USERNAME"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          
+          if ($env:TAILSCALE_IP) {
+            Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+            Write-Host "(Most Secure - Use Tailscale VPN)"
+          } elseif ($env:PUBLIC_IP) {
+            Write-Host "Public IP: $env:PUBLIC_IP"
+            Write-Host "(Less Secure - Open to internet)"
+          }
+          
+          Write-Host ""
+          Write-Host "Workflow will run for 6 hours"
+          Write-Host "=============================================="
+
+      - name: Maintain Connection
+        run: |
+          $startTime = Get-Date
+          while ($true) {
+            $elapsed = (Get-Date) - $startTime
+            Write-Host "[$(Get-Date)] Running for: $($elapsed.ToString('hh\:mm\:ss'))"
+            
+            # Show both IPs if available
+            if ($env:TAILSCALE_IP) {
+              Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+            }
+            if ($env:PUBLIC_IP) {
+              Write-Host "Public IP: $env:PUBLIC_IP"
+            }
+            
+            Start-Sleep -Seconds 60
+          }          
           Add-LocalGroupMember -Group "Administrators" -Member $username
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
           
