@@ -1,0 +1,228 @@
+name: Persistent RDP with Same Username
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */5 * * *'  # Every 5 hours (GitHub's max is 6 hours runtime)
+
+env:
+  PERSISTENT_HOSTNAME: "github-rdp-persistent"
+  RDP_USERNAME: "RDPUser"  # Fixed username
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 330  # 5.5 hours (allows time for restart)
+
+    steps:
+      - name: Check for existing setup
+        id: check-existing
+        run: |
+          # Check if user already exists
+          $userExists = Get-LocalUser -Name "$env:RDP_USERNAME" -ErrorAction SilentlyContinue
+          if ($userExists) {
+            echo "USER_EXISTS=true" >> $env:GITHUB_ENV
+          }
+          
+          # Check if Tailscale is already running
+          if (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe") {
+            $status = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | ConvertFrom-Json
+            if ($status.BackendState -eq "Running") {
+              echo "TS_ALREADY_RUNNING=true" >> $env:GITHUB_ENV
+              $existingIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              echo "EXISTING_IP=$existingIP" >> $env:GITHUB_ENV
+            }
+          }
+
+      - name: Configure Core RDP Settings
+        run: |
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                           -Name "fDenyTSConnections" -Value 0 -Force
+          
+          # Configure security settings
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "SecurityLayer" -Value 0 -Force
+
+          # Configure firewall
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+
+      - name: Create or Update RDP User with Same Username
+        run: |
+          $username = "$env:RDP_USERNAME"
+          
+          if ($env:USER_EXISTS -eq 'true') {
+              Write-Host "User '$username' already exists, keeping same username..."
+          } else {
+              Write-Host "Creating new user '$username'..."
+              New-LocalUser -Name $username -AccountNeverExpires
+              Add-LocalGroupMember -Group "Administrators" -Member $username
+              Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+          }
+          
+          # Always set a new password for security
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = [char[]](35,36,37,38,42,64,94)  # # $ % & * @ ^
+          }
+          
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 3
+          $rawPassword += $charSet.Lower | Get-Random -Count 3
+          $rawPassword += $charSet.Number | Get-Random -Count 3
+          $rawPassword += $charSet.Special | Get-Random -Count 2
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          Set-LocalUser -Name $username -Password $securePass
+          
+          # Store credentials securely
+          echo "RDP_CREDS=User: $username | Password: $password" >> $env:GITHUB_ENV
+          echo "RDP_USERNAME=$username" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+      - name: Install Tailscale
+        if: env.TS_ALREADY_RUNNING != 'true'
+        run: |
+          if (-not (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe")) {
+            Write-Host "Installing Tailscale..."
+            $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+            $installerPath = "$env:TEMP\tailscale.msi"
+            Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+            Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+            Remove-Item $installerPath -Force
+            Write-Host "Tailscale installed successfully"
+          } else {
+            Write-Host "Tailscale already installed"
+          }
+
+      - name: Establish Persistent Tailscale Connection
+        run: |
+          if ($env:TS_ALREADY_RUNNING -eq 'true') {
+            Write-Host "Tailscale already running with IP: $env:EXISTING_IP"
+            echo "TAILSCALE_IP=$env:EXISTING_IP" >> $env:GITHUB_ENV
+          } else {
+            Write-Host "Setting up Tailscale with persistent hostname: $env:PERSISTENT_HOSTNAME"
+            
+            # Use --reset to ensure clean connection
+            & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+              --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+              --hostname=$env:PERSISTENT_HOSTNAME `
+              --accept-routes=true `
+              --reset
+            
+            # Wait for IP assignment
+            $tsIP = $null
+            $retries = 0
+            while (-not $tsIP -and $retries -lt 20) {
+                Start-Sleep -Seconds 3
+                $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+                $retries++
+                Write-Host "Attempt $retries/20 - Waiting for Tailscale IP..."
+            }
+            
+            if (-not $tsIP) {
+                Write-Error "Tailscale IP not assigned after 20 attempts"
+                exit 1
+            }
+            
+            echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+            Write-Host "Tailscale connected successfully with IP: $tsIP"
+            
+            # Also get the MagicDNS name for persistent access
+            $magicDNS = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | ConvertFrom-Json | Select-Object -ExpandProperty MagicDNSSuffix
+            echo "TAILSCALE_HOSTNAME=$env:PERSISTENT_HOSTNAME.$magicDNS" >> $env:GITHUB_ENV
+          }
+
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Testing RDP connectivity to: $env:TAILSCALE_IP"
+          
+          # Test multiple times to ensure connection is ready
+          $maxAttempts = 10
+          $attempt = 1
+          $connected = $false
+          
+          while (-not $connected -and $attempt -le $maxAttempts) {
+              Write-Host "Connection test attempt $attempt/$maxAttempts"
+              $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue -InformationLevel Quiet
+              
+              if ($testResult) {
+                  $connected = $true
+                  Write-Host "RDP connectivity successful!"
+              } else {
+                  Start-Sleep -Seconds 10
+                  $attempt++
+              }
+          }
+          
+          if (-not $connected) {
+              Write-Warning "RDP connection test failed, but continuing anyway..."
+          }
+
+      - name: Display Connection Information
+        run: |
+          Write-Host "`n=============================================="
+          Write-Host "PERSISTENT RDP ACCESS - SAME USERNAME"
+          Write-Host "=============================================="
+          Write-Host "IP Address: $env:TAILSCALE_IP"
+          Write-Host "Hostname: $env:TAILSCALE_HOSTNAME"
+          Write-Host "Username: $env:RDP_USERNAME"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host ""
+          Write-Host "This connection will:"
+          Write-Host "- Auto-restart every 5 hours"
+          Write-Host "- Maintain same username: $env:RDP_USERNAME"
+          Write-Host "- Use persistent Tailscale hostname"
+          Write-Host "=============================================="
+          Write-Host "`n"
+
+      - name: Maintain Persistent Connection
+        run: |
+          # Calculate end time (5 hours from now)
+          $endTime = (Get-Date).AddHours(5)
+          Write-Host "Session will run until: $($endTime.ToString('yyyy-MM-dd HH:mm:ss'))"
+          Write-Host "Time remaining: 5 hours"
+          
+          # Keep alive loop with periodic status updates
+          $checkInterval = 300  # 5 minutes
+          $lastIPCheck = Get-Date
+          
+          while ((Get-Date) -lt $endTime) {
+              $timeRemaining = $endTime - (Get-Date)
+              Write-Host "[$(Get-Date)] RDP Active - Time remaining: $($timeRemaining.ToString('hh\:mm\:ss'))"
+              
+              # Periodically verify Tailscale connection
+              if (((Get-Date) - $lastIPCheck).TotalMinutes -ge 10) {
+                  $currentIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+                  if ($currentIP -ne $env:TAILSCALE_IP) {
+                      Write-Host "IP changed from $env:TAILSCALE_IP to $currentIP"
+                      echo "TAILSCALE_IP=$currentIP" >> $env:GITHUB_ENV
+                  }
+                  $lastIPCheck = Get-Date
+              }
+              
+              # Sleep until next check
+              Start-Sleep -Seconds $checkInterval
+          }
+          
+          Write-Host "5-hour session completed. Workflow will auto-restart."
+
+  # Notification step (optional)
+  restart-notification:
+    needs: secure-rdp
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify Restart
+        run: |
+          echo "RDP session completed successfully"
+          echo "Next auto-restart will occur in approximately 30 minutes"
