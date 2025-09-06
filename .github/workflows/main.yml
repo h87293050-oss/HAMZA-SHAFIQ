@@ -1,90 +1,65 @@
-name: Persistent RDP with Same Username
+name: RDP with Public IP Fallback
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 */5 * * *'  # Every 5 hours (GitHub's max is 6 hours runtime)
-
-env:
-  PERSISTENT_HOSTNAME: "github-rdp-persistent"
-  RDP_USERNAME: "RDPUser"  # Fixed username
 
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 330  # 5.5 hours (allows time for restart)
+    timeout-minutes: 360
 
     steps:
-      - name: Check for existing setup
-        id: check-existing
+      - name: Get Public IP
+        id: ip
         run: |
-          # Check if user already exists
-          $userExists = Get-LocalUser -Name "$env:RDP_USERNAME" -ErrorAction SilentlyContinue
-          if ($userExists) {
-            echo "USER_EXISTS=true" >> $env:GITHUB_ENV
-          }
-          
-          # Check if Tailscale is already running
-          if (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe") {
-            $status = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | ConvertFrom-Json
-            if ($status.BackendState -eq "Running") {
-              echo "TS_ALREADY_RUNNING=true" >> $env:GITHUB_ENV
-              $existingIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              echo "EXISTING_IP=$existingIP" >> $env:GITHUB_ENV
-            }
-          }
+          $publicIP = (Invoke-RestMethod -Uri "https://api.ipify.org").Trim()
+          echo "PUBLIC_IP=$publicIP" >> $env:GITHUB_ENV
+          Write-Host "Public IP: $publicIP"
 
-      - name: Configure Core RDP Settings
+      - name: Configure RDP Settings
         run: |
-          # Enable Remote Desktop
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                           -Name "fDenyTSConnections" -Value 0 -Force
+          # Enable RDP
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           
-          # Configure security settings
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                           -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                           -Name "SecurityLayer" -Value 0 -Force
+          # Open firewall for RDP
+          netsh advfirewall firewall add rule name="Open RDP Port" dir=in action=allow protocol=TCP localport=3389
 
-          # Configure firewall
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
-
-          Restart-Service -Name TermService -Force
-
-      - name: Create or Update RDP User with Same Username
+      - name: Create User with Fixed Credentials
         run: |
-          $username = "$env:RDP_USERNAME"
+          $username = "RDPUser"
+          $password = "Password123!"
           
-          if ($env:USER_EXISTS -eq 'true') {
-              Write-Host "User '$username' already exists, keeping same username..."
-          } else {
-              Write-Host "Creating new user '$username'..."
-              New-LocalUser -Name $username -AccountNeverExpires
-              Add-LocalGroupMember -Group "Administrators" -Member $username
-              Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
-          }
-          
-          # Always set a new password for security
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper   = [char[]](65..90)
-              Lower   = [char[]](97..122)
-              Number  = [char[]](48..57)
-              Special = [char[]](35,36,37,38,42,64,94)  # # $ % & * @ ^
-          }
-          
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 3
-          $rawPassword += $charSet.Lower | Get-Random -Count 3
-          $rawPassword += $charSet.Number | Get-Random -Count 3
-          $rawPassword += $charSet.Special | Get-Random -Count 2
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
-          
+          # Create user
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -ErrorAction SilentlyContinue
           Set-LocalUser -Name $username -Password $securePass
           
+          Add-LocalGroupMember -Group "Administrators" -Member $username
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+          
+          echo "RDP_CREDS=User: $username | Password: $password" >> $env:GITHUB_ENV
+          echo "RDP_USERNAME=$username" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+      - name: Display Connection Info
+        run: |
+          Write-Host "=============================================="
+          Write-Host "IMMEDIATE RDP ACCESS"
+          Write-Host "=============================================="
+          Write-Host "IP Address: $env:PUBLIC_IP"
+          Write-Host "Username: $env:RDP_USERNAME"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host ""
+          Write-Host "Note: This uses public IP - be cautious!"
+          Write-Host "=============================================="
+
+      - name: Keep Alive
+        run: |
+          # Keep running for 6 hours
+          Write-Host "RDP is now accessible at $env:PUBLIC_IP"
+          Write-Host "Press Ctrl+C in GitHub to stop this workflow"
+          Start-Sleep -Seconds 21600          
           # Store credentials securely
           echo "RDP_CREDS=User: $username | Password: $password" >> $env:GITHUB_ENV
           echo "RDP_USERNAME=$username" >> $env:GITHUB_ENV
